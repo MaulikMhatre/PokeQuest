@@ -6,30 +6,25 @@ from functools import wraps
 from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
-import requests # ADDED: Library for making HTTP requests
+import requests
 
-# Note: For the hackathon environment, you will need to install these:
-# pip install Flask Flask-CORS requests werkzeug
 
-# --- Configuration ---
 DATABASE = 'pokequest.db'
-# IMPORTANT: Replace this with your actual, FULL, 39+ character Gemini API Key
-API_KEY = "AIzaSyA7esi4sf8C7hn--84JgBAYKj6_W4OkQEc"
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={API_KEY}"
-# --- End Configuration ---
+API_KEY = "AIzaSyBgJZJh6k2XF6wOflzbRSU5jr5TAzeH5ig" 
+MODEL_NAME = "gemini-2.5-flash" 
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
+
 
 app = Flask(__name__)
-# Enable CORS for all routes so your Next.js frontend can connect
 CORS(app)
 
-# --- Database Setup Functions ---
+
 
 def get_db():
     """Connects to the specific database."""
     db = getattr(g, '_database', None)
     if db is None:
         db = g._database = sqlite3.connect(DATABASE)
-        # Allows accessing columns by name instead of index
         db.row_factory = sqlite3.Row
     return db
 
@@ -46,14 +41,14 @@ def init_db():
         db = get_db()
         cursor = db.cursor()
 
-        # 1. Users Table (Now includes Auth fields)
+        # 1. Users Table 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
-                auth_token TEXT UNIQUE,        -- Token for API requests
-                pokemon_name TEXT NOT NULL,
+                auth_token TEXT UNIQUE,      -- Token for API requests
+                pokemon_name TEXT DEFAULT 'Pikachu',  
                 xp INTEGER DEFAULT 0,
                 level INTEGER DEFAULT 1,
                 badges INTEGER DEFAULT 0,
@@ -61,8 +56,12 @@ def init_db():
                 last_quiz_weak_topics TEXT DEFAULT '[]'
             );
         """)
+        try:
+            db.execute("SELECT pokemon_name FROM users LIMIT 1")
+        except sqlite3.OperationalError:
+            print("Adding 'pokemon_name' column to existing users table.")
+            db.execute("ALTER TABLE users ADD COLUMN pokemon_name TEXT DEFAULT 'Pikachu'")
 
-        # 2. Quizzes Table (History and Leaderboard Data)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS quizzes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,10 +76,10 @@ def init_db():
         """)
         db.commit()
 
-# Call this once to create the tables
+
 init_db()
 
-# --- Security Decorator ---
+
 
 def auth_required(f):
     """Decorator to check for a valid Auth Token in the request header."""
@@ -99,39 +98,21 @@ def auth_required(f):
         if user is None:
             return jsonify({"error": "Invalid or expired token."}), 401
         
-        # Pass the user_id to the wrapped function
         kwargs['user_id'] = user['user_id']
         return f(*args, **kwargs)
 
     return decorated
 
-# --- Utility Functions for Logic (Updated Gemini API Call) ---
+
 
 def gemini_api_call(prompt, system_instruction):
     """
     Implements the actual Gemini API call logic using the 'requests' library,
     including structured JSON output and exponential backoff.
     """
-    print(f"--- Calling Gemini for Quiz Generation ---")
+    print(f"--- Calling Gemini for Quiz Generation using {MODEL_NAME} ---")
     
-    # Check if the API key is set correctly (must be longer than the common prefix)
-    if API_KEY == "YOUR_FULL_GEMINI_API_KEY_HERE" or len(API_KEY) < 30:
-         # Fallback to a mock response if the key is not set or incomplete
-        time.sleep(0.5) 
-        mock_response_json = {
-             "quiz_title": "MOCK QUIZ (API Key Missing/Invalid)",
-             "questions": [
-                { "id": 1, "question": "What is the force required to accelerate a 10kg mass at 2m/s^2?", "options": ["5 N", "20 N", "12 N", "8 N"], "answer": "20 N", "topic": "Newton's Second Law" },
-                { "id": 2, "question": "Vector A is 3 units east, Vector B is 4 units north. What is the magnitude of A + B?", "options": ["5 units", "7 units", "1 unit", "12 units"], "answer": "5 units", "topic": "Vector Addition" },
-                { "id": 3, "question": "Calculate the molar mass of water ($H_2O$)?", "options": ["16 g/mol", "18 g/mol", "2 g/mol", "32 g/mol"], "answer": "18 g/mol", "topic": "Stoichiometry" },
-                { "id": 4, "question": "Which of the following is not a primary color?", "options": ["Red", "Green", "Blue", "Yellow"], "answer": "Green", "topic": "Light and Color" },
-                { "id": 5, "question": "If you are struggling with this, please check your Gemini API key.", "options": ["OK", "Will check", "Got it", "Thanks"], "answer": "Will check", "topic": "API Troubleshooting" },
-             ]
-        }
-        print("ALERT: Using mock data because the Gemini API key is missing or invalid.")
-        return mock_response_json
 
-    # 1. Define the desired JSON structure for the quiz response
     response_schema = {
         "type": "OBJECT",
         "properties": {
@@ -153,7 +134,6 @@ def gemini_api_call(prompt, system_instruction):
         }
     }
 
-    # 2. Construct the API Payload
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "systemInstruction": {"parts": [{"text": system_instruction}]},
@@ -163,43 +143,48 @@ def gemini_api_call(prompt, system_instruction):
         }
     }
 
-    # 3. Make the API Call with Exponential Backoff
+
     MAX_RETRIES = 5
     for i in range(MAX_RETRIES):
         try:
-            # Send the request
             response = requests.post(
                 API_URL, 
                 headers={'Content-Type': 'application/json'}, 
                 data=json.dumps(payload)
             )
-            response.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
+
+            response.raise_for_status() 
             
-            # Extract and parse the response text
             result = response.json()
-            # The structured JSON is returned as a string inside the 'text' field
-            json_text = result['candidates'][0]['content']['parts'][0]['text']
-            
-            # We parse the string back into a Python dictionary
-            return json.loads(json_text)
+            try:
+                json_text = result['candidates'][0]['content']['parts'][0]['text']
+            except (KeyError, IndexError) as e:
+                print(f"Gemini API Response Structure Error: {e}. Full result: {result}")
+                return {"error": "Gemini API returned an unparsable structure. Check console for details."}
+
+
+            try:
+                return json.loads(json_text)
+            except json.JSONDecodeError as e:
+                print(f"Gemini JSON Decode Error: {e}. Raw text was: {json_text}")
+                return {"error": "Gemini generated non-JSON or invalid JSON output."}
+
 
         except requests.exceptions.HTTPError as e:
-            if response.status_code == 429 and i < MAX_RETRIES - 1:
-                # Handle rate limiting (429) with exponential backoff
+            error_details = response.text
+            print(f"Gemini API HTTP Error: {response.status_code}. Details: {error_details}")
+            
+            if response.status_code in [429, 500, 503] and i < MAX_RETRIES - 1:
                 delay = 2 ** i
-                # Note: No log printing here to adhere to non-logging retry instruction
+                print(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
             else:
-                # Re-raise or return error for other HTTP issues
-                print(f"Gemini API HTTP Error: {e}")
-                return {"error": f"API Request Failed ({response.status_code}): {response.text}"}
+                return {"error": f"API Request Failed ({response.status_code}): {error_details}"}
         
         except Exception as e:
-            # Handle JSON parsing errors or other unexpected errors
-            print(f"Gemini API Unexpected Error: {e}")
-            return {"error": f"Failed to generate quiz due to internal error: {e}"}
+            print(f"Gemini API Network/Unexpected Error: {e}")
+            return {"error": f"Failed to generate quiz due to network error: {e}"}
 
-    # If all retries fail
     return {"error": "Gemini API failed after multiple retries."}
 
 
@@ -211,44 +196,33 @@ def calculate_new_xp(current_xp, correct_answers):
     xp_gained = correct_answers * XP_PER_CORRECT_ANSWER
     new_xp = current_xp + xp_gained
 
-    # Simple leveling logic (adjust as needed)
     new_level = 1 + (new_xp // XP_REQUIRED_PER_LEVEL)
     
-    # Badges unlocked is simply a reflection of level achieved
+
     badges_unlocked = new_level - 1 
 
     return new_xp, new_level, badges_unlocked
 
-
-# ⭐ NEW: Function to determine Pokémon stage and image URL
 def get_pokemon_status(name, level):
     """
     Determines the visual appearance/evolution stage of the Pokémon based on the trainer's level.
-    
-    NOTE: Replace the placeholder URLs with actual hosted 3D renders or sprites.
     """
-    # Simple, mock evolution tiers
+
     if level >= 5:
         stage = "Final Evolution"
-        # Placeholder for Final Stage image URL
+
         image_url = f"https://placehold.co/200x200/4c7cff/white?text={name}+Evo3"
     elif level >= 3:
         stage = "Middle Evolution"
-        # Placeholder for Middle Stage image URL
         image_url = f"https://placehold.co/200x200/ff9933/white?text={name}+Evo2"
     else:
         stage = "Basic Stage"
-        # Placeholder for Basic Stage image URL
         image_url = f"https://placehold.co/200x200/80ff80/black?text={name}+Evo1"
 
     return {
         "evolution_status": f"Level {level}, {stage}",
         "image_url": image_url
     }
-# ⭐ END NEW FUNCTION
-
-
-# --- New Authentication Endpoints ---
 
 @app.route('/api/register', methods=['POST'])
 def register():
@@ -256,7 +230,7 @@ def register():
     data = request.json
     username = data.get('username')
     password = data.get('password')
-    pokemon_name = data.get('pokemon_name')
+    pokemon_name = data.get('pokemon_name') 
 
     if not all([username, password, pokemon_name]):
         return jsonify({"error": "Missing username, password, or pokemon_name"}), 400
@@ -264,7 +238,6 @@ def register():
     db = get_db()
     try:
         password_hash = generate_password_hash(password)
-        # Use a random UUID for user_id (not just the username)
         user_id = secrets.token_urlsafe(16)
         
         db.execute(
@@ -293,33 +266,32 @@ def login():
 
     db = get_db()
     cursor = db.execute(
-        "SELECT user_id, password_hash FROM users WHERE username = ?", (username,)
+        "SELECT user_id, password_hash, pokemon_name FROM users WHERE username = ?", (username,)
     )
     user = cursor.fetchone()
 
     if not user:
-         # User not found (Return 401 instead of 404 to avoid revealing valid usernames)
-         return jsonify({"error": "Invalid username or password."}), 401
+            return jsonify({"error": "Invalid username or password."}), 401
     
     if check_password_hash(user['password_hash'], password):
-        # Successful login: Generate and store a new token
         auth_token = secrets.token_urlsafe(32)
         db.execute(
             "UPDATE users SET auth_token = ? WHERE user_id = ?", 
             (auth_token, user['user_id'])
         )
         db.commit()
+        theme_to_return = "pokemon_kalos" if user['pokemon_name'] in ['Pikachu', 'Bulbasaur', 'Charmander', 'Squirtle'] else "one_piece" 
         
         return jsonify({
             "message": "Login successful",
             "auth_token": auth_token,
-            "user_id": user['user_id']
+            "user_id": user['user_id'],
+            "theme": theme_to_return, 
+            "pokemon_name": user['pokemon_name'] 
         }), 200
     
-    # Password mismatch
     return jsonify({"error": "Invalid username or password."}), 401
 
-# --- Protected Data Endpoints (Updated) ---
 
 @app.route('/api/dashboard', methods=['GET'])
 @auth_required
@@ -334,11 +306,8 @@ def get_dashboard(user_id):
 
     if user:
         user_dict = dict(user)
-        # Total XP for next level is currently 300, based on leveling logic
         xp_required = 300 
-        xp_for_next_level = xp_required - (user_dict['xp'] % xp_required)
         
-        # ⭐ NEW: Get the calculated status and image URL
         pokemon_status = get_pokemon_status(user_dict['pokemon_name'], user_dict['level'])
 
         return jsonify({
@@ -353,8 +322,8 @@ def get_dashboard(user_id):
                 "name": user_dict['pokemon_name'],
                 "xp_stat": f"{user_dict['xp'] % xp_required}/{xp_required}", 
                 "total_xp": user_dict['xp'],
-                "evolution_status": pokemon_status['evolution_status'], # Updated status
-                "image_url": pokemon_status['image_url'] # ⭐ NEW: Image URL for the frontend
+                "evolution_status": pokemon_status['evolution_status'], 
+                "image_url": pokemon_status['image_url'] 
             },
             "achievements": {
                 "badges": user_dict['badges']
@@ -362,7 +331,6 @@ def get_dashboard(user_id):
             "last_weak_topics": json.loads(user_dict['last_quiz_weak_topics'])
         }), 200
     
-    # Should not be reached if auth_required works, but good practice.
     return jsonify({"error": "User data not found."}), 404
 
 
@@ -374,12 +342,11 @@ def generate_quiz(user_id):
     calls the API, and returns the quiz.
     """
     data = request.json
-    subject = data.get('subject') # e.g., 'Physics', 'Chemistry', 'Math'
+    subject = data.get('subject') 
     
     if not subject:
         return jsonify({"error": "Missing subject"}), 400
 
-    # 1. Fetch user's weakness data
     db = get_db()
     cursor = db.execute(
         "SELECT last_quiz_weak_topics, level FROM users WHERE user_id = ?", (user_id,)
@@ -387,30 +354,27 @@ def generate_quiz(user_id):
     user_data = cursor.fetchone()
     
     if not user_data:
-        # Fallback for unexpected case where authenticated user data is missing
         return jsonify({"error": "User data retrieval failed."}), 404
 
     weak_topics = json.loads(user_data['last_quiz_weak_topics'] or '[]')
     current_level = user_data['level']
-    difficulty = "Intermediate (High School Level)" if current_level <= 3 else "Advanced"
-    
-    weak_topics_str = ", ".join(weak_topics) if weak_topics else "General foundational concepts"
 
-    # 2. Construct the Gemini Prompt (Same as before)
-    system_instruction = "You are an accurate and reliable PokeQuest Quiz Master. All generated questions must be factually correct, academically relevant, and strictly adhere to all safety guidelines."
+    difficulty = "Intermediate (High School Level)" if current_level <= 3 else "Advanced (College Level)"
+    
+    weak_topics_str = ", ".join(weak_topics) if weak_topics else "General foundational concepts" 
+    system_instruction = "You are an accurate and reliable PokeQuest Quiz Master. All generated questions must be factually correct, academically relevant, and strictly adhere to all safety guidelines. Your response must be a single, valid JSON object."
 
     prompt = f"""
-        You are an expert educational content generator. Generate exactly 5 multiple-choice questions for the subject **{subject}** at an **{difficulty}** difficulty.
+        You are an expert educational content generator. Generate exactly 5 multiple-choice questions for the subject *{subject}* at an *{difficulty}* difficulty.
 
-        **CRITICAL INSTRUCTION: GENERATE NEW QUESTIONS THE USER HAS NEVER SEEN. DO NOT REPEAT ANY QUESTIONS FROM PREVIOUS QUIZZES.**
+        *CRITICAL INSTRUCTION: GENERATE NEW QUESTIONS THE USER HAS NEVER SEEN. DO NOT REPEAT ANY QUESTIONS FROM PREVIOUS QUIZZES.*
         
-        **Crucially, prioritize creating at least 3 of the 5 questions focused on the following weak topics:**
-        **{weak_topics_str}**
+        *Crucially, prioritize creating at least 3 of the 5 questions focused on the following weak topics:*
+        *{weak_topics_str}*
 
         The output must be a single JSON object that strictly follows the schema.
     """
-    
-    # 3. Call the Gemini API 
+
     quiz_data = gemini_api_call(prompt, system_instruction)
 
     if quiz_data.get('error'):
@@ -425,26 +389,21 @@ def submit_quiz(user_id):
     """Saves quiz results, updates user XP, level, and weak topics."""
     data = request.json
     subject = data.get('subject')
-    score = data.get('score') # correct answers count
+    score = data.get('score') 
     total_questions = data.get('total_questions')
-    new_weak_topics = data.get('new_weak_topics') # List of strings from frontend analysis
+    new_weak_topics = data.get('new_weak_topics') 
 
     if not all([subject, score is not None, total_questions, new_weak_topics is not None]):
         return jsonify({"error": "Missing required quiz data"}), 400
 
     db = get_db()
     try:
-        # 1. Get current user stats
         cursor = db.execute("SELECT xp, level FROM users WHERE user_id = ?", (user_id,))
         user = cursor.fetchone()
         
         current_xp = user['xp']
         new_xp, new_level, badges_unlocked = calculate_new_xp(current_xp, score)
-        
-        # Convert weak topics list to JSON string for storage
         weak_topics_json = json.dumps(new_weak_topics)
-
-        # 2. Update User XP, Level, and Weak Topics
         db.execute("""
             UPDATE users SET 
                 xp = ?, 
@@ -454,7 +413,6 @@ def submit_quiz(user_id):
             WHERE user_id = ?
         """, (new_xp, new_level, badges_unlocked, weak_topics_json, user_id))
 
-        # 3. Record Quiz History
         db.execute("""
             INSERT INTO quizzes (user_id, subject, score, total_questions, weak_topics) 
             VALUES (?, ?, ?, ?, ?)
@@ -487,11 +445,11 @@ def get_leaderboard():
     leaderboard_data = [dict(row) for row in cursor.fetchall()]
     return jsonify(leaderboard_data), 200
 
-if __name__ == '__main__':
+if __name__ == '_main_':
     print(f"Database initialized at: {DATABASE}")
     print("--- API Endpoints ---")
-    print("POST /api/register -> Creates user")
-    print("POST /api/login -> Returns auth_token")
+    print("POST /api/register -> Creates user (Now requires pokemon_name)")
+    print("POST /api/login -> Returns auth_token and pokemon_name/theme")
     print("GET /api/dashboard -> Requires Bearer token")
     print("POST /api/generate_quiz -> Requires Bearer token")
     print("POST /api/submit_quiz -> Requires Bearer token")
