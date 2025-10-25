@@ -2,6 +2,7 @@ import sqlite3
 import json
 import time
 import secrets
+import os # Added for path and environment variables
 from functools import wraps
 from flask import Flask, g, jsonify, request
 from flask_cors import CORS
@@ -9,15 +10,25 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import requests
 
 
-DATABASE = 'pokequest.db'
-API_KEY = "AIzaSyBgJZJh6k2XF6wOflzbRSU5jr5TAzeH5ig" 
+# --- DEPLOYMENT CHANGES START ---
+
+# 1. Database Path: CRITICAL CHANGE
+# This points the SQLite file to the Render Persistent Disk mount path (/data).
+# **You must configure a Persistent Disk with the Mount Path /data on Render.**
+DATABASE = os.path.join('/data', 'pokequest.db')
+
+# 2. API Key: CRITICAL CHANGE
+# Load the API key from a secure environment variable named GEMINI_API_KEY.
+# **You must set GEMINI_API_KEY in your Render environment variables.**
+API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyBgJZJh6k2XF6wOflzbRSU5jr5TAzeH5ig_DEV_KEY')
 MODEL_NAME = "gemini-2.5-flash" 
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
+
+# --- DEPLOYMENT CHANGES END ---
 
 
 app = Flask(__name__)
 CORS(app)
-
 
 
 def get_db():
@@ -48,7 +59,7 @@ def init_db():
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 auth_token TEXT UNIQUE,      -- Token for API requests
-                pokemon_name TEXT DEFAULT 'Pikachu',  
+                pokemon_name TEXT DEFAULT 'Pikachu',    
                 xp INTEGER DEFAULT 0,
                 level INTEGER DEFAULT 1,
                 badges INTEGER DEFAULT 0,
@@ -57,6 +68,7 @@ def init_db():
             );
         """)
         try:
+            # Check for column existence defensively
             db.execute("SELECT pokemon_name FROM users LIMIT 1")
         except sqlite3.OperationalError:
             print("Adding 'pokemon_name' column to existing users table.")
@@ -80,7 +92,6 @@ def init_db():
 init_db()
 
 
-
 def auth_required(f):
     """Decorator to check for a valid Auth Token in the request header."""
     @wraps(f)
@@ -102,7 +113,6 @@ def auth_required(f):
         return f(*args, **kwargs)
 
     return decorated
-
 
 
 def gemini_api_call(prompt, system_instruction):
@@ -445,13 +455,5 @@ def get_leaderboard():
     leaderboard_data = [dict(row) for row in cursor.fetchall()]
     return jsonify(leaderboard_data), 200
 
-if __name__ == '_main_':
-    print(f"Database initialized at: {DATABASE}")
-    print("--- API Endpoints ---")
-    print("POST /api/register -> Creates user (Now requires pokemon_name)")
-    print("POST /api/login -> Returns auth_token and pokemon_name/theme")
-    print("GET /api/dashboard -> Requires Bearer token")
-    print("POST /api/generate_quiz -> Requires Bearer token")
-    print("POST /api/submit_quiz -> Requires Bearer token")
-    print("GET /api/leaderboard -> Public")
-    app.run(debug=True)
+# 3. Development server removal: Removed the `if __name__ == '__main__':` block.
+# Gunicorn will import the `app` object directly when run.
