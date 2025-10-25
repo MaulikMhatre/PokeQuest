@@ -18,7 +18,7 @@ from sqlalchemy import exc
 
 # CRITICAL: Load the database URL and API Key from Render Environment Variables
 DATABASE_URL = os.environ.get('DATABASE_URL') 
-API_KEY = os.environ.get('GEMINI_API_KEY', 'AIzaSyBgJZJh6k2XF6wOflzbRSU5jr5TAzeH5ig')
+API_KEY = os.environ.get('GEMINI_API_KEY', 'DEV_KEY_NOT_SET')
 
 MODEL_NAME = "gemini-2.5-flash" 
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
