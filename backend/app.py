@@ -1,80 +1,84 @@
+import sqlite3
 import json
 import time
 import secrets
-import os
 from functools import wraps
-
-# --- NEW IMPORTS FOR POSTGRESQL/SQLAlchemy ---
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 import requests
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import exc
-# --- END NEW IMPORTS ---
 
 
-# --- DEPLOYMENT VARIABLES (LOADED FROM RENDER ENVIRONMENT) ---
-
-# CRITICAL: Load the database URL and API Key from Render Environment Variables
-DATABASE_URL = os.environ.get('DATABASE_URL') 
-API_KEY = os.environ.get('GEMINI_API_KEY', 'DEV_KEY_NOT_SET')
-
+DATABASE = 'pokequest.db'
+API_KEY = "AIzaSyBgJZJh6k2XF6wOflzbRSU5jr5TAzeH5ig" 
 MODEL_NAME = "gemini-2.5-flash" 
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
-
-# --- END DEPLOYMENT VARIABLES ---
 
 
 app = Flask(__name__)
 CORS(app)
 
-# --- FLASK-SQLALCHEMY CONFIGURATION ---
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
-# --- END CONFIGURATION ---
 
 
-# --- DATABASE MODELS (Representing your tables in Python) ---
+def get_db():
+    """Connects to the specific database."""
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+    return db
 
-class User(db.Model):
-    __tablename__ = 'users'
-    user_id = db.Column(db.Text, primary_key=True)
-    username = db.Column(db.Text, unique=True, nullable=False)
-    password_hash = db.Column(db.Text, nullable=False)
-    auth_token = db.Column(db.Text, unique=True)
-    pokemon_name = db.Column(db.Text, default='Pikachu')
-    xp = db.Column(db.Integer, default=0)
-    level = db.Column(db.Integer, default=1)
-    badges = db.Column(db.Integer, default=0)
-    streak = db.Column(db.Integer, default=0)
-    last_quiz_weak_topics = db.Column(db.Text, default='[]') # Stored as JSON string
+@app.teardown_appcontext
+def close_connection(exception):
+    """Closes the database connection at the end of the request."""
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
 
-class Quiz(db.Model):
-    __tablename__ = 'quizzes'
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Text, db.ForeignKey('users.user_id'))
-    subject = db.Column(db.Text, nullable=False)
-    score = db.Column(db.Integer, nullable=False)
-    total_questions = db.Column(db.Integer, nullable=False)
-    weak_topics = db.Column(db.Text) # Stored as JSON string
-    timestamp = db.Column(db.DateTime, default=db.func.now())
+def init_db():
+    """Initializes the database schema."""
+    with app.app_context():
+        db = get_db()
+        cursor = db.cursor()
 
-# --- END DATABASE MODELS ---
+        # 1. Users Table 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                auth_token TEXT UNIQUE,      -- Token for API requests
+                pokemon_name TEXT DEFAULT 'Pikachu',  
+                xp INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 1,
+                badges INTEGER DEFAULT 0,
+                streak INTEGER DEFAULT 0,
+                last_quiz_weak_topics TEXT DEFAULT '[]'
+            );
+        """)
+        try:
+            db.execute("SELECT pokemon_name FROM users LIMIT 1")
+        except sqlite3.OperationalError:
+            print("Adding 'pokemon_name' column to existing users table.")
+            db.execute("ALTER TABLE users ADD COLUMN pokemon_name TEXT DEFAULT 'Pikachu'")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS quizzes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                subject TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                total_questions INTEGER NOT NULL,
+                weak_topics TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            );
+        """)
+        db.commit()
 
 
-# --- DATABASE INITIALIZATION (Creates tables in PostgreSQL if they don't exist) ---
-with app.app_context():
-    try:
-        # This function looks at the Models above and creates the corresponding PostgreSQL tables
-        db.create_all()
-        print("PostgreSQL Database tables initialized successfully.")
-    except Exception as e:
-        # This will print an error if the DATABASE_URL is invalid or the database service isn't reachable
-        print(f"ERROR: Could not connect to or initialize PostgreSQL database. {e}")
+init_db()
 
-# --- END DATABASE INITIALIZATION ---
 
 
 def auth_required(f):
@@ -87,16 +91,18 @@ def auth_required(f):
 
         token = auth_header.split(' ')[1]
         
-        # Using ORM to find user by token
-        user = User.query.filter_by(auth_token=token).one_or_none()
+        db = get_db()
+        cursor = db.execute("SELECT user_id FROM users WHERE auth_token = ?", (token,))
+        user = cursor.fetchone()
 
         if user is None:
             return jsonify({"error": "Invalid or expired token."}), 401
         
-        kwargs['user_id'] = user.user_id
+        kwargs['user_id'] = user['user_id']
         return f(*args, **kwargs)
 
     return decorated
+
 
 
 def gemini_api_call(prompt, system_instruction):
@@ -104,12 +110,9 @@ def gemini_api_call(prompt, system_instruction):
     Implements the actual Gemini API call logic using the 'requests' library,
     including structured JSON output and exponential backoff.
     """
-    # Check if API Key is actually available from environment variables
-    if not API_KEY or API_KEY == 'DEV_KEY_NOT_SET':
-        return {"error": "API Key is missing. Please set GEMINI_API_KEY environment variable."}
-        
     print(f"--- Calling Gemini for Quiz Generation using {MODEL_NAME} ---")
     
+
     response_schema = {
         "type": "OBJECT",
         "properties": {
@@ -194,6 +197,8 @@ def calculate_new_xp(current_xp, correct_answers):
     new_xp = current_xp + xp_gained
 
     new_level = 1 + (new_xp // XP_REQUIRED_PER_LEVEL)
+    
+
     badges_unlocked = new_level - 1 
 
     return new_xp, new_level, badges_unlocked
@@ -205,6 +210,7 @@ def get_pokemon_status(name, level):
 
     if level >= 5:
         stage = "Final Evolution"
+
         image_url = f"https://placehold.co/200x200/4c7cff/white?text={name}+Evo3"
     elif level >= 3:
         stage = "Middle Evolution"
@@ -229,31 +235,24 @@ def register():
     if not all([username, password, pokemon_name]):
         return jsonify({"error": "Missing username, password, or pokemon_name"}), 400
 
+    db = get_db()
     try:
         password_hash = generate_password_hash(password)
         user_id = secrets.token_urlsafe(16)
         
-        # --- ORM INSERT/CREATE ---
-        new_user = User(
-            user_id=user_id,
-            username=username,
-            password_hash=password_hash,
-            pokemon_name=pokemon_name
+        db.execute(
+            "INSERT INTO users (user_id, username, password_hash, pokemon_name) VALUES (?, ?, ?, ?)",
+            (user_id, username, password_hash, pokemon_name)
         )
-        db.session.add(new_user)
-        db.session.commit()
-        # --- END ORM INSERT/CREATE ---
-
+        db.commit()
         return jsonify({
             "message": "Registration successful. Please log in.",
             "user_id": user_id
         }), 201
-    except exc.IntegrityError:
-        db.session.rollback() # Rollback session on error
+    except sqlite3.IntegrityError:
         return jsonify({"error": "Username already taken."}), 409
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": f"Database error during registration: {e}"}), 500
+    except sqlite3.Error as e:
+        return jsonify({"error": f"Database error: {e}"}), 500
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -265,63 +264,71 @@ def login():
     if not all([username, password]):
         return jsonify({"error": "Missing username or password"}), 400
 
-    # --- ORM SELECT ---
-    user = User.query.filter_by(username=username).one_or_none()
+    db = get_db()
+    cursor = db.execute(
+        "SELECT user_id, password_hash, pokemon_name FROM users WHERE username = ?", (username,)
+    )
+    user = cursor.fetchone()
 
-    if not user or not check_password_hash(user.password_hash, password):
-        return jsonify({"error": "Invalid username or password."}), 401
+    if not user:
+            return jsonify({"error": "Invalid username or password."}), 401
     
-    # Password checked out. Generate token and update.
-    auth_token = secrets.token_urlsafe(32)
-    user.auth_token = auth_token
-    db.session.commit()
-    # --- END ORM SELECT/UPDATE ---
-
-    theme_to_return = "pokemon_kalos" if user.pokemon_name in ['Pikachu', 'Bulbasaur', 'Charmander', 'Squirtle'] else "one_piece" 
+    if check_password_hash(user['password_hash'], password):
+        auth_token = secrets.token_urlsafe(32)
+        db.execute(
+            "UPDATE users SET auth_token = ? WHERE user_id = ?", 
+            (auth_token, user['user_id'])
+        )
+        db.commit()
+        theme_to_return = "pokemon_kalos" if user['pokemon_name'] in ['Pikachu', 'Bulbasaur', 'Charmander', 'Squirtle'] else "one_piece" 
+        
+        return jsonify({
+            "message": "Login successful",
+            "auth_token": auth_token,
+            "user_id": user['user_id'],
+            "theme": theme_to_return, 
+            "pokemon_name": user['pokemon_name'] 
+        }), 200
     
-    return jsonify({
-        "message": "Login successful",
-        "auth_token": auth_token,
-        "user_id": user.user_id,
-        "theme": theme_to_return, 
-        "pokemon_name": user.pokemon_name 
-    }), 200
+    return jsonify({"error": "Invalid username or password."}), 401
 
 
 @app.route('/api/dashboard', methods=['GET'])
 @auth_required
 def get_dashboard(user_id):
     """Fetches user data using the token and the user_id passed by the decorator."""
-    # --- ORM SELECT ---
-    user = User.query.filter_by(user_id=user_id).one_or_none()
+    db = get_db()
+    cursor = db.execute(
+        "SELECT user_id, username, pokemon_name, xp, level, badges, streak, last_quiz_weak_topics FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    user = cursor.fetchone()
 
     if user:
+        user_dict = dict(user)
         xp_required = 300 
         
-        pokemon_status = get_pokemon_status(user.pokemon_name, user.level)
-
-        # Retrieve weak topics, ensuring it is parsed from the TEXT field
-        last_weak_topics = json.loads(user.last_quiz_weak_topics or '[]')
+        pokemon_status = get_pokemon_status(user_dict['pokemon_name'], user_dict['level'])
 
         return jsonify({
             "trainer_card": {
-                "user_id": user.user_id,
-                "username": user.username,
-                "level": user.level,
-                "xp": user.xp,
-                "streak": user.streak
+                "user_id": user_dict['user_id'],
+                "username": user_dict['username'],
+                "level": user_dict['level'],
+                "xp": user_dict['xp'],
+                "streak": user_dict['streak']
             },
             "pokemon_panel": {
-                "name": user.pokemon_name,
-                "xp_stat": f"{user.xp % xp_required}/{xp_required}", 
-                "total_xp": user.xp,
+                "name": user_dict['pokemon_name'],
+                "xp_stat": f"{user_dict['xp'] % xp_required}/{xp_required}", 
+                "total_xp": user_dict['xp'],
                 "evolution_status": pokemon_status['evolution_status'], 
                 "image_url": pokemon_status['image_url'] 
             },
             "achievements": {
-                "badges": user.badges
+                "badges": user_dict['badges']
             },
-            "last_weak_topics": last_weak_topics
+            "last_weak_topics": json.loads(user_dict['last_quiz_weak_topics'])
         }), 200
     
     return jsonify({"error": "User data not found."}), 404
@@ -340,15 +347,17 @@ def generate_quiz(user_id):
     if not subject:
         return jsonify({"error": "Missing subject"}), 400
 
-    # --- ORM SELECT ---
-    user = User.query.filter_by(user_id=user_id).one_or_none()
+    db = get_db()
+    cursor = db.execute(
+        "SELECT last_quiz_weak_topics, level FROM users WHERE user_id = ?", (user_id,)
+    )
+    user_data = cursor.fetchone()
     
-    if not user:
+    if not user_data:
         return jsonify({"error": "User data retrieval failed."}), 404
 
-    weak_topics = json.loads(user.last_quiz_weak_topics or '[]')
-    current_level = user.level
-    # --- END ORM SELECT ---
+    weak_topics = json.loads(user_data['last_quiz_weak_topics'] or '[]')
+    current_level = user_data['level']
 
     difficulty = "Intermediate (High School Level)" if current_level <= 3 else "Advanced (College Level)"
     
@@ -387,34 +396,29 @@ def submit_quiz(user_id):
     if not all([subject, score is not None, total_questions, new_weak_topics is not None]):
         return jsonify({"error": "Missing required quiz data"}), 400
 
+    db = get_db()
     try:
-        # --- ORM SELECT and UPDATE ---
-        user = User.query.filter_by(user_id=user_id).one_or_none()
-        if not user:
-            return jsonify({"error": "User not found."}), 404
+        cursor = db.execute("SELECT xp, level FROM users WHERE user_id = ?", (user_id,))
+        user = cursor.fetchone()
         
-        current_xp = user.xp
+        current_xp = user['xp']
         new_xp, new_level, badges_unlocked = calculate_new_xp(current_xp, score)
         weak_topics_json = json.dumps(new_weak_topics)
-        
-        # 1. Update user record
-        user.xp = new_xp
-        user.level = new_level
-        user.badges = badges_unlocked
-        user.last_quiz_weak_topics = weak_topics_json
+        db.execute("""
+            UPDATE users SET 
+                xp = ?, 
+                level = ?, 
+                badges = ?, 
+                last_quiz_weak_topics = ?
+            WHERE user_id = ?
+        """, (new_xp, new_level, badges_unlocked, weak_topics_json, user_id))
 
-        # 2. Create new quiz record
-        new_quiz = Quiz(
-            user_id=user_id,
-            subject=subject,
-            score=score,
-            total_questions=total_questions,
-            weak_topics=weak_topics_json
-        )
-        
-        db.session.add(new_quiz)
-        db.session.commit()
-        # --- END ORM UPDATE/INSERT ---
+        db.execute("""
+            INSERT INTO quizzes (user_id, subject, score, total_questions, weak_topics) 
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, subject, score, total_questions, weak_topics_json))
+
+        db.commit()
 
         return jsonify({
             "message": "Quiz submitted and user data updated",
@@ -424,27 +428,30 @@ def submit_quiz(user_id):
             "badges_unlocked": badges_unlocked
         }), 200
 
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": f"Database error during quiz submission: {e}"}), 500
+    except sqlite3.Error as e:
+        return jsonify({"error": f"Database error: {e}"}), 500
 
 
 @app.route('/api/leaderboard', methods=['GET'])
 def get_leaderboard():
     """Fetches top users ranked by total XP (No auth required for public view)."""
-    # --- ORM SELECT ---
-    # Fetch top 10 users by descending XP
-    leaderboard_data = User.query.order_by(User.xp.desc()).limit(10).all()
-    
-    # Convert SQLAlchemy objects to list of dictionaries
-    results = []
-    for user in leaderboard_data:
-        results.append({
-            "username": user.username,
-            "pokemon_name": user.pokemon_name,
-            "xp": user.xp,
-            "level": user.level
-        })
-    # --- END ORM SELECT ---
+    db = get_db()
+    cursor = db.execute("""
+        SELECT username, pokemon_name, xp, level 
+        FROM users 
+        ORDER BY xp DESC 
+        LIMIT 10
+    """)
+    leaderboard_data = [dict(row) for row in cursor.fetchall()]
+    return jsonify(leaderboard_data), 200
 
-    return jsonify(results), 200
+if __name__ == '_main_':
+    print(f"Database initialized at: {DATABASE}")
+    print("--- API Endpoints ---")
+    print("POST /api/register -> Creates user (Now requires pokemon_name)")
+    print("POST /api/login -> Returns auth_token and pokemon_name/theme")
+    print("GET /api/dashboard -> Requires Bearer token")
+    print("POST /api/generate_quiz -> Requires Bearer token")
+    print("POST /api/submit_quiz -> Requires Bearer token")
+    print("GET /api/leaderboard -> Public")
+    app.run(debug=True)
