@@ -3,3 +3,5 @@ Flask-CORS
 werkzeug
 gunicorn
 requests
+Flask-SQLAlchemy
+psycopg2-binary
